@@ -93,6 +93,12 @@ class MainWindowController: PlayerWindowController {
     return playlistView
   }()
 
+  lazy var pluginView: PluginViewController = {
+    let pluginView = PluginViewController()
+    pluginView.mainWindow = self
+    return pluginView
+  }()
+
   /** The control view for interactive mode. */
   var cropSettingsView: CropBoxViewController?
 
@@ -271,12 +277,16 @@ class MainWindowController: PlayerWindowController {
     case hidden // indicating that sidebar is hidden. Should only be used by `sideBarStatus`
     case settings
     case playlist
+    case plugins
+
     func width() -> CGFloat {
       switch self {
       case .settings:
         return SettingsWidth
       case .playlist:
         return CGFloat(Preference.integer(for: .playlistWidth)).clamped(to: PlaylistMinWidth...PlaylistMaxWidth)
+      case .plugins:
+        return SettingsWidth
       default:
         Logger.fatal("SideBarViewType.width shouldn't be called here")
       }
@@ -710,7 +720,6 @@ class MainWindowController: PlayerWindowController {
   }
 
   private func setupOSCToolbarButtons(_ buttons: [Preference.ToolBarButton]) {
-    var buttons = buttons
     fragToolbarView.views.forEach { fragToolbarView.removeView($0) }
     for buttonType in buttons {
       let button = NSButton()
@@ -1885,7 +1894,7 @@ class MainWindowController: PlayerWindowController {
       osdAccessoryText.baseWritingDirection = .leftToRight
       fallthrough
     case .withText(let text):
-      // data for mustache redering
+      // data for mustache rendering
       let osdData: [String: String] = [
         "duration": player.info.videoDuration?.stringRepresentation ?? Constants.String.videoTimePlaceholder,
         "position": player.info.videoPosition?.stringRepresentation ?? Constants.String.videoTimePlaceholder,
@@ -2331,7 +2340,8 @@ class MainWindowController: PlayerWindowController {
         // sample aspect ratio (SAR). A typical configuration is SAR 1440x1080i (4:3) w/ DAR 1920x1080 (16:9). Here we try
         // to get the display aspect ratio from mpv to properly display the thumbnail.
         let displayAspectRatio: CGFloat
-        if let width = player.info.displayWidth, let height = player.info.displayHeight {
+        if let width = player.info.displayWidth, width != 0,
+           let height = player.info.displayHeight, height != 0 {
           displayAspectRatio = CGFloat(width) / CGFloat(height)
         } else {
           displayAspectRatio = thumbnailPeekView.imageView.image!.size.aspect
@@ -2652,9 +2662,9 @@ class MainWindowController: PlayerWindowController {
     }
   }
 
-  override func updatePlayButtonState(_ state: NSControl.StateValue) {
-    super.updatePlayButtonState(state)
-    if state == .off {
+  override func updatePlayButtonState(paused: Bool) {
+    super.updatePlayButtonState(paused: paused)
+    if paused {
       speedValueIndex = AppData.availableSpeedValues.count / 2
       leftArrowLabel.isHidden = true
       rightArrowLabel.isHidden = true
@@ -2807,8 +2817,7 @@ class MainWindowController: PlayerWindowController {
         rightArrowLabel.stringValue = String(format: "%.0fx", speedValue)
       }
       // if is paused
-      if playButton.state == .off {
-        updatePlayButtonState(.on)
+      if player.info.state == .paused {
         player.resume()
       }
 
@@ -2836,7 +2845,7 @@ class MainWindowController: PlayerWindowController {
         view.pleaseSwitchToTab(tab)
       }
       showSideBar(viewController: view, type: .settings)
-    case .playlist:
+    case .playlist, .plugins:
       if let tab = tab {
         view.pleaseSwitchToTab(tab)
       }
@@ -2865,7 +2874,7 @@ class MainWindowController: PlayerWindowController {
         view.pleaseSwitchToTab(tab)
       }
       showSideBar(viewController: view, type: .playlist)
-    case .settings:
+    case .settings, .plugins:
       if let tab = tab {
         view.pleaseSwitchToTab(tab)
       }
@@ -2874,6 +2883,35 @@ class MainWindowController: PlayerWindowController {
       }
     case .playlist:
       if view.currentTab == tab || tab == nil {
+        if hideIfAlreadyShown {
+          hideSideBar()
+        }
+      } else if let tab = tab {
+        view.pleaseSwitchToTab(tab)
+      }
+    }
+  }
+
+  func showPluginSidebar(tab: String?, force: Bool = false, hideIfAlreadyShown: Bool = true) {
+    if !force && sidebarAnimationState == .willShow || sidebarAnimationState == .willHide {
+      return  // do not interrupt other actions while it is animating
+    }
+    let view = pluginView
+    switch sideBarStatus {
+    case .hidden:
+      if let tab = tab {
+        view.pleaseSwitchToTab(tab)
+      }
+      showSideBar(viewController: view, type: .plugins)
+    case .settings, .playlist:
+      if let tab = tab {
+        view.pleaseSwitchToTab(tab)
+      }
+      hideSideBar {
+        self.showSideBar(viewController: view, type: .plugins)
+      }
+    case .plugins:
+      if view.currentPluginID == tab || tab == nil {
         if hideIfAlreadyShown {
           hideSideBar()
         }
@@ -2919,6 +2957,8 @@ class MainWindowController: PlayerWindowController {
       quickSettingView.showSubChooseMenu(forView: sender, showLoadedSubs: true)
     case .screenshot:
       player.screenshot()
+    case .plugins:
+      showPluginSidebar(tab: nil)
     }
   }
 
