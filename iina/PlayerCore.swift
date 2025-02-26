@@ -108,10 +108,23 @@ class PlayerCore: NSObject {
   }
   private var _touchBarSupport: Any?
 
-  /// `true` if this Mac is known to have a touch bar.
+  /// `true` if this Mac is _known to_ have a  [Touch Bar](https://support.apple.com/guide/mac-help/use-the-touch-bar-mchlbfd5b039/mac).
   ///
-  /// - Note: This is set based on whether `AppKit` has called `MakeTouchBar`, therefore it can, for example, be `false` for
-  ///         a MacBook that has a touch bar if the touch bar is asleep because the Mac is in closed clamshell mode.
+  /// In order to adhere to energy efficiency best practices IINA should stop the timer that synchronizes the UI when it is not needed.
+  /// As one job of the timer is to update the Touch Bar on Macs that have one, IINA needs information such as:
+  /// - Does this host have a Touch Bar?
+  /// - Is the Touch Bar configured to show app controls?
+  /// - Is the Touch Bar awake?
+  /// - Is the host being operated in closed clamshell mode?
+  ///
+  /// This is the kind of information needed to avoid running the timer and updating controls that are not visible. Unfortunately in the
+  /// documentation for [NSTouchBar](https://developer.apple.com/documentation/appkit/nstouchbar) Apple
+  /// indicates "There’s no need, and no API, for your app to know whether or not there’s a Touch Bar available". So this property is
+  /// set based off whether `AppKit` has requested that a `NSTouchBar` object be created by calling
+  /// [MakeTouchBar](https://developer.apple.com/documentation/appkit/nsresponder/2544690-maketouchbar).
+  /// This property is used to avoid running the timer on Macs that do not have a Touch Bar. It also may avoid running the timer when a
+  /// MacBook with a Touch Bar is being operated in closed clamshell mode as `AppKit` will not call `MakeTouchBar` when the
+  /// Touch Bar is asleep.
   var needsTouchBar = false
 
   /// A dispatch queue for auto load feature.
@@ -248,13 +261,21 @@ class PlayerCore: NSObject {
     self.miniPlayer = MiniPlayerWindowController(playerCore: self)
     self.initialWindow = InitialWindowController(playerCore: self)
     self._touchBarSupport = TouchBarSupport(playerCore: self)
+    TouchBarSettings.shared.addObserver(self, forKey: .PresentationModeFnModes)
+    TouchBarSettings.shared.addObserver(self, forKey: .PresentationModeGlobal)
+    TouchBarSettings.shared.addObserver(self, forKey: .PresentationModePerApp)
   }
 
   // MARK: - Plugins
 
-  static func reloadPluginForAll(_ plugin: JavascriptPlugin) {
-    playerCores.forEach { $0.reloadPlugin(plugin) }
+  static func reloadPluginForAll(_ plugin: JavascriptPlugin, forced: Bool = false) {
+    playerCores.forEach { $0.reloadPlugin(plugin, forced: forced) }
     AppDelegate.shared.menuController?.updatePluginMenu()
+  }
+
+  func clearPlugins() {
+    pluginMap.removeAll()
+    plugins.removeAll()
   }
 
   func loadPlugins() {
@@ -283,7 +304,7 @@ class PlayerCore: NSObject {
     }
 
     plugins = JavascriptPlugin.plugins.compactMap { pluginMap[$0.identifier] }
-    mainWindow.quickSettingView.updatePluginTabs()
+    mainWindow.pluginView.updatePluginTabs()
   }
 
   // MARK: - Control
@@ -412,6 +433,11 @@ class PlayerCore: NSObject {
     mainWindow.pendingShow = true
     miniPlayer.pendingShow = true
     initialWindow.close()
+
+    // Make sure playback does not start once the file is loaded. Playback will be started in the
+    // fileLoaded method once IINA is ready assuming the user has not enabled the setting to pause
+    // when media is opened.
+    mpv.setFlag(MPVOption.PlaybackControl.pause, true, level: .verbose)
 
     // Send load file command
     info.justOpenedFile = true
@@ -1041,9 +1067,12 @@ class PlayerCore: NSObject {
       // A loop point has been set. B loop point must be set as well to activate looping.
       info.abLoopStatus = b == 0 ? .aSet : .bSet
     }
-    // The play slider has knobs representing the loop points, make insure the slider is in sync.
-    mainWindow?.syncSlider()
     log("Synchronized info.abLoopStatus \(info.abLoopStatus)")
+
+    // If window is not loaded the play slider knobs can't be synchronized.
+    guard mainWindow.loaded, info.state.active else { return }
+    // The play slider has knobs representing the loop points, make insure the slider is in sync.
+    mainWindow.syncSlider()
   }
 
   func togglePlaylistLoop() {
@@ -1322,8 +1351,8 @@ class PlayerCore: NSObject {
     for path in paths {
       _addToPlaylist(path)
     }
-    if index <= info.playlist.count && index >= 0 {
-      let previousCount = info.playlist.count
+    let previousCount = info.$playlist.withLock { $0.count }
+    if index <= previousCount && index >= 0 {
       for i in 0..<paths.count {
         playlistMove(previousCount + i, to: index + i)
       }
@@ -1838,8 +1867,16 @@ class PlayerCore: NSObject {
   func fileLoaded() {
     guard info.state.active else { return }
     log("File loaded")
+
+    // Normally playback will be paused at this point because PlayerCore sets playback to be paused
+    // before loading a file. This is required to be able to support the setting to pause when media
+    // is opened, otherwise there would be a race condition as to whether IINA can pause playback
+    // before mpv has started playing the media. However plugins have direct access to mpv and can
+    // load files. Ensure mpv is paused so IINA and mpv are in sync on the state of playback.
     info.state = .paused
+    syncUI(.playButton)
     mpv.setFlag(MPVOption.PlaybackControl.pause, true, level: .verbose)
+
     // Get video size and set the initial window size
     let width = mpv.getInt(MPVProperty.width)
     let height = mpv.getInt(MPVProperty.height)
@@ -1984,6 +2021,27 @@ class PlayerCore: NSObject {
     if ontop != mainWindow.isOntop {
       mainWindow.setWindowFloatingOnTop(ontop)
     }
+  }
+
+  func pauseChanged(_ paused: Bool) {
+    guard mainWindow.loaded, info.state.loaded else { return }
+    if (info.state == .paused) != paused {
+      sendOSD(paused ? .pause : .resume)
+      info.state = paused ? .paused : .playing
+      refreshSyncUITimer()
+      // Follow energy efficiency best practices and ensure IINA is absolutely idle when the video
+      // is paused to avoid wasting energy with needless processing. If paused shutdown the timer
+      // that synchronizes the UI and the high priority display link thread.
+      if paused {
+        mainWindow.videoView.displayIdle()
+      } else {
+        mainWindow.videoView.displayActive()
+      }
+    }
+    if Preference.bool(for: .alwaysFloatOnTop) {
+      mainWindow.setWindowFloatingOnTop(!paused)
+    }
+    syncUI(.playButton)
   }
 
   func playbackRestarted() {
@@ -2174,9 +2232,14 @@ class PlayerCore: NSObject {
 
   // MARK: - Sync with UI in MainWindow
 
+  /// Assess the need for the timer that synchronizes the UI and start or stop it as needed.
+  ///
   /// Call this when `syncUITimer` may need to be started, stopped, or needs its interval changed. It will figure out the correct action.
-  /// Just need to make sure that any state variables (e.g., `info.isPaused`, `isInMiniPlayer`,  etc.) are set *before* calling this method,
-  /// not after, so that it makes the correct decisions.
+  ///
+  /// This method is required to adhere to the best practices in the [Energy Efficiency Guide for Mac Apps](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/UsingEfficientGraphics.html#//apple_ref/doc/uid/TP40013929-CH27-SW1)
+  /// that call for an app to avoid needless energy use. [Minimizing Timer Usage](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/Timers.html#//apple_ref/doc/uid/TP40013929-CH5-SW1) is one of the recommended best practices.
+  /// - Important: Make sure that any state variables (e.g., `info.isPaused`, `isInMiniPlayer`,  etc.) are set *before*
+  ///     calling this method, not after, so that it makes the correct decisions.
   func refreshSyncUITimer() {
     // Check if timer should start/restart
 
@@ -2184,28 +2247,17 @@ class PlayerCore: NSObject {
     if !info.state.active {
       useTimer = false
     } else if info.state == .paused {
-      // Follow energy efficiency best practices and ensure IINA is absolutely idle when the
-      // video is paused to avoid wasting energy with needless processing. If paused shutdown
-      // the timer that synchronizes the UI and the high priority display link thread.
+      // Ensure IINA is absolutely idle when the video is paused.
       useTimer = false
-    } else if needsTouchBar || isInMiniPlayer {
-      // Follow energy efficiency best practices and stop the timer that updates the OSC while it is
-      // hidden. However the timer can't be stopped if the mini player is being used as it always
-      // displays the OSC or the timer is also updating the information being displayed in the
-      // touch bar. Does this host have a touch bar? Is the touch bar configured to show app controls?
-      // Is the touch bar awake? Is the host being operated in closed clamshell mode? This is the kind
-      // of information needed to avoid running the timer and updating controls that are not visible.
-      // Unfortunately in the documentation for NSTouchBar Apple indicates "There’s no need, and no
-      // API, for your app to know whether or not there’s a Touch Bar available". So this code keys
-      // off whether AppKit has requested that a NSTouchBar object be created. This avoids running the
-      // timer on Macs that do not have a touch bar. It also may avoid running the timer when a
-      // MacBook with a touch bar is being operated in closed clameshell mode.
+    } else if needsTouchBar && TouchBarSettings.shared.showAppControls || isInMiniPlayer {
+      // The timer can't be stopped if the mini player is being used as it always displays the OSC
+      // or if the timer is updating the information being displayed in the Touch Bar.
       useTimer = true
     } else if info.isNetworkResource {
-      // May need to show, hide, or update buffering indicator at any time
+      // May need to show, hide, or update buffering indicator at any time.
       useTimer = true
     } else {
-      // Need if fadeable views or OSD are visible
+      // Need if fadeable views or OSD are visible.
       useTimer = mainWindow.isUITimerNeeded()
     }
 
@@ -2241,14 +2293,16 @@ class PlayerCore: NSObject {
       }
     }
 
+    // When fadeable views are hidden the time can get out of sync. This method will be called when
+    // the view becomes visible to sync the time. If the timer was not running the view must be
+    // updated now. Playback may be paused. If that is the case then the timer will not be started.
+    if !wasTimerRunning {
+      syncUITime()
+    }
+
     guard useTimer else { return }
 
     // Timer will start
-
-    if !wasTimerRunning {
-      // Do not wait for first redraw
-      syncUITime()
-    }
 
     syncUITimer = Timer.scheduledTimer(
       timeInterval: timeInterval,
@@ -2331,9 +2385,9 @@ class PlayerCore: NSObject {
       }
 
     case .playButton:
-      DispatchQueue.main.async {
-        self.currentController.updatePlayButtonState(self.info.state == .paused ? .off : .on)
-        self.touchBarSupport.updateTouchBarPlayBtn()
+      DispatchQueue.main.async { [self] in
+        currentController.updatePlayButtonState(paused: info.state == .paused)
+        touchBarSupport.updateTouchBarPlayBtn()
       }
 
     case .volume:
@@ -2496,14 +2550,16 @@ class PlayerCore: NSObject {
   }
 
   func getPlaylist() {
-    info.playlist.removeAll()
-    let playlistCount = mpv.getInt(MPVProperty.playlistCount)
-    for index in 0..<playlistCount {
-      let playlistItem = MPVPlaylistItem(filename: mpv.getString(MPVProperty.playlistNFilename(index))!,
-                                         isCurrent: mpv.getFlag(MPVProperty.playlistNCurrent(index)),
-                                         isPlaying: mpv.getFlag(MPVProperty.playlistNPlaying(index)),
-                                         title: mpv.getString(MPVProperty.playlistNTitle(index)))
-      info.playlist.append(playlistItem)
+    info.$playlist.withLock { playlist in
+      playlist.removeAll()
+      let playlistCount = mpv.getInt(MPVProperty.playlistCount)
+      for index in 0..<playlistCount {
+        let playlistItem = MPVPlaylistItem(filename: mpv.getString(MPVProperty.playlistNFilename(index))!,
+                                           isCurrent: mpv.getFlag(MPVProperty.playlistNCurrent(index)),
+                                           isPlaying: mpv.getFlag(MPVProperty.playlistNPlaying(index)),
+                                           title: mpv.getString(MPVProperty.playlistNTitle(index)))
+        playlist.append(playlistItem)
+      }
     }
   }
 
@@ -2528,6 +2584,36 @@ class PlayerCore: NSObject {
 
   func postNotification(_ name: Notification.Name) {
     NotificationCenter.default.post(Notification(name: name, object: self))
+  }
+
+  /// Observer for changes to the macOS Touch Bar settings.
+  /// - Parameters:
+  ///   - keyPath; The key path, relative to `object`, to the value that has changed.
+  ///   - object: The source object of the key path `keyPath`.
+  ///   - change: A dictionary that describes the changes that have been made to the value of the property at the key path
+  ///             `keyPath` relative to object. Entries are described in `Change Dictionary Keys`.
+  ///   - context: The value that was provided when the observer was registered to receive key-value observation notifications.
+  override func observeValue(forKeyPath keyPath: String?, of object: Any?,
+                             change: [NSKeyValueChangeKey: Any]?,
+                             context: UnsafeMutableRawPointer?) {
+    // The following guards are sanity checks and should never report an error.
+    guard let keyPath = keyPath else {
+      log("Observed key path is missing", level: .error)
+      return
+    }
+    guard let key = TouchBarSettings.Key(rawValue: keyPath) else {
+      log("Observed key path is not a touch bar setting: \(keyPath)", level: .error)
+      return
+    }
+    guard key == .PresentationModeFnModes || key == .PresentationModeGlobal ||
+          key == .PresentationModePerApp else {
+      log("Observed key path is unrecognized: \(keyPath)", level: .error)
+      return
+    }
+    log("Touch Bar \(key) setting has changed")
+    // The macOS settings that control what the Touch Bar displays has changed. May need to start or
+    // stop the timer that refreshes the UI.
+    refreshSyncUITimer()
   }
 
   // MARK: - Utils
